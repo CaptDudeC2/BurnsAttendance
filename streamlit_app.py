@@ -1,10 +1,13 @@
 """Burns Attendance - staff-only daily attendance board.
 
 Reads the "Attendance Calendar 2026-2027" Google Sheet (link-shared, read-only)
-and shows who's out and who's here today, plus the week's notes.
+and renders it like the AT-A-GLANCE wall calendar in the shop: a monthly grid,
+Sunday-Saturday, with the day number and notes in each cell. Today gets a
+blue outline; Sundays and dealership holidays are greyed out.
 
-Staff only: NOT linked from the Fixed Ops Pulse landing page. Reached from
-the Tech Pulse and Advisor Pulse apps.
+Top strip shows today's out/here summary. Staff only: NOT linked from the
+Fixed Ops Pulse landing page. Reached from the Tech Pulse, Advisor Pulse,
+and Dispatch apps.
 
 This app is READ ONLY - all editing stays in the Google Sheet. Note format
 the app parses (written in the cells under the day number in the month tab):
@@ -12,7 +15,8 @@ the app parses (written in the cells under the day number in the month tab):
     "PTO - Matt"        -> out, reason "PTO"
 """
 
-from datetime import date, timedelta
+from datetime import date
+from html import escape
 
 import pandas as pd
 import streamlit as st
@@ -39,6 +43,7 @@ TAB_GIDS = {
     "December 2027": "1015",
     "Closed Dates": "1016",
 }
+MONTHS = [m for m in TAB_GIDS if m != "Closed Dates"]
 
 # (first name as written in calendar notes, full name, role)
 ROSTER = [
@@ -79,36 +84,55 @@ def load_tab(gid):
     return pd.read_csv(url, header=None, dtype=str).fillna("")
 
 
-def month_tab_name(d):
-    return d.strftime("%B %Y")
+@st.cache_data(ttl=3600)
+def closed_map():
+    """ISO date -> holiday name from the Closed Dates tab."""
+    try:
+        df = load_tab(TAB_GIDS["Closed Dates"])
+    except Exception:
+        return {}
+    out = {}
+    for row in df.values.tolist():
+        if len(row) >= 1 and str(row[0]).strip():
+            name = (
+                str(row[1]).strip()
+                if len(row) > 1 and str(row[1]).strip()
+                else "Closed"
+            )
+            out[str(row[0]).strip()] = name
+    return out
 
 
-def day_notes(df, day):
-    """Note strings written under the given day number in a month tab.
+def month_weeks(df):
+    """Parse a month tab into weeks; each week is 7 cells (Sun..Sat).
 
+    A cell is None (blank) or (day_number, [note strings]).
     Layout: a day-number row (several numeric cells), then 4 note rows.
     """
     rows = df.values.tolist()
-    for i, row in enumerate(rows):
-        cells = [str(c).strip() for c in row]
-        if sum(c.isdigit() for c in cells) >= 3 and str(day) in cells:
-            col = cells.index(str(day))
-            notes = []
-            for r in rows[i + 1 : i + 5]:
-                if col < len(r):
-                    v = str(r[col]).strip()
-                    if v:
-                        notes.append(v)
-            return notes
-    return []
-
-
-def notes_for(d):
-    tab = month_tab_name(d)
-    gid = TAB_GIDS.get(tab)
-    if not gid:
-        return []
-    return day_notes(load_tab(gid), d.day)
+    weeks = []
+    i, n = 0, len(rows)
+    while i < n:
+        cells = [str(c).strip() for c in rows[i]]
+        if sum(c.isdigit() for c in cells) >= 3:
+            week = []
+            for col in range(7):
+                c = cells[col] if col < len(cells) else ""
+                if c.isdigit():
+                    notes = []
+                    for r in rows[i + 1 : i + 5]:
+                        if col < len(r):
+                            v = str(r[col]).strip()
+                            if v:
+                                notes.append(v)
+                    week.append((int(c), notes))
+                else:
+                    week.append(None)
+            weeks.append(week)
+            i += 5
+        else:
+            i += 1
+    return weeks
 
 
 def parse_note(note):
@@ -127,22 +151,81 @@ def parse_note(note):
     return None, reason
 
 
-def closed_reason(d):
-    """Holiday name if the shop is closed this date, else None."""
-    if d.weekday() == 6:  # Sunday
-        return "Sunday - shop closed"
-    try:
-        df = load_tab(TAB_GIDS["Closed Dates"])
-    except Exception:
-        return None
-    iso = d.isoformat()
-    for row in df.values.tolist():
-        if len(row) >= 1 and str(row[0]).strip() == iso:
-            return str(row[1]).strip() if len(row) > 1 else "Holiday - shop closed"
-    return None
+def note_class(note):
+    """CSS class for a calendar cell note."""
+    _name, reason = parse_note(note)
+    if reason in ("PTO", "Vacation"):
+        return "pto"
+    if reason in ("Called out", "Sick"):
+        return "out"
+    if reason:
+        return "other"
+    return "holiday"
 
 
-st.set_page_config(page_title="Burns Attendance", page_icon="🗓️", layout="centered")
+CAL_CSS = """
+<style>
+.cal{border:2px solid #1a1a1a;border-radius:4px;overflow:hidden;
+font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+.cal-row{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));}
+.cal-h{background:#1a1a1a;color:#fff;font-weight:700;text-align:center;
+padding:7px 2px;font-size:13px;}
+.cal-c{border:1px solid #d5d5d5;min-height:92px;padding:4px 5px;background:#fff;}
+.cal-c .dn{font-weight:700;font-size:14px;line-height:1.1;}
+.cal-c.today{box-shadow:inset 0 0 0 3px #0B74C5;background:#eef6ff;}
+.cal-c.shut{background:#f2f2f2;}
+.cal-c.shut .dn{color:#999;}
+.note{font-size:12px;margin-top:3px;line-height:1.3;word-break:break-word;}
+.note.pto{color:#0B74C5;font-weight:600;}
+.note.out{color:#c0392b;font-weight:600;}
+.note.other{color:#333;}
+.note.holiday{color:#8a8a8a;font-style:italic;}
+@media (max-width:640px){.cal-c{min-height:74px;}.note{font-size:11px;}.cal-h{font-size:11px;}}
+</style>
+"""
+
+
+def render_month(year, month, weeks, closed, today):
+    """Build the calendar-grid HTML for one month."""
+    parts = [CAL_CSS, '<div class="cal">']
+    parts.append(
+        '<div class="cal-row">'
+        + "".join(f'<div class="cal-h">{d}</div>' for d in
+                  ["Sunday", "Monday", "Tuesday", "Wednesday",
+                   "Thursday", "Friday", "Saturday"])
+        + "</div>"
+    )
+    for week in weeks:
+        parts.append('<div class="cal-row">')
+        for col, cell in enumerate(week):
+            if cell is None:
+                parts.append('<div class="cal-c"></div>')
+                continue
+            daynum, notes = cell
+            d = date(year, month, daynum)
+            iso = d.isoformat()
+            classes = ["cal-c"]
+            if d == today:
+                classes.append("today")
+            shut_name = closed.get(iso)
+            if col == 6 or shut_name:  # Sunday or holiday
+                classes.append("shut")
+            inner = [f'<div class="dn">{daynum}</div>']
+            if shut_name:
+                inner.append(
+                    f'<div class="note holiday">{escape(shut_name)}</div>')
+            for note in notes:
+                inner.append(
+                    f'<div class="note {note_class(note)}">'
+                    f"{escape(note)}</div>")
+            parts.append(
+                f'<div class="{" ".join(classes)}">{"".join(inner)}</div>')
+        parts.append("</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+st.set_page_config(page_title="Burns Attendance", page_icon="🗓️", layout="wide")
 
 st.title("🗓️ Burns Attendance")
 st.caption("Staff only · Live from the Attendance Calendar · Read-only")
@@ -153,8 +236,20 @@ if st.button("↻ Refresh now"):
 
 try:
     today = date.today()
-    closed = closed_reason(today)
-    todays_notes = [] if closed else notes_for(today)
+    closed = closed_map()
+    cur_name = today.strftime("%B %Y")
+    cur_idx = MONTHS.index(cur_name) if cur_name in MONTHS else 0
+    if "moff" not in st.session_state:
+        st.session_state.moff = 0
+    st.session_state.moff = max(-cur_idx,
+                                min(len(MONTHS) - 1 - cur_idx,
+                                    st.session_state.moff))
+    sel = MONTHS[cur_idx + st.session_state.moff]
+    year, mon = int(sel.split()[1]), [
+        "January", "February", "March", "April", "May", "June", "July",
+        "August", "September", "October", "November", "December",
+    ].index(sel.split()[0]) + 1
+    weeks = month_weeks(load_tab(TAB_GIDS[sel]))
 except Exception as exc:
     st.error(
         "Couldn't load the calendar "
@@ -163,12 +258,18 @@ except Exception as exc:
     )
     st.stop()
 
+# ---- today strip ----
 st.subheader(today.strftime("%A, %B %d, %Y"))
-
-if closed:
-    st.warning(f"🏠 Shop closed — {closed}")
+closed_today = closed.get(today.isoformat())
+if today.weekday() == 6 or closed_today:
+    st.warning(f"🏠 Shop closed — {closed_today or 'Sunday'}")
 else:
-    out = {}  # full name -> reason
+    todays_notes = []
+    for week in weeks:
+        for cell in week:
+            if cell and cell[0] == today.day and sel == cur_name:
+                todays_notes = cell[1]
+    out = {}
     unnamed = []
     for note in todays_notes:
         name, reason = parse_note(note)
@@ -176,38 +277,39 @@ else:
             out[name] = reason
         elif reason:
             unnamed.append(f"{note} ({reason})")
-        # notes with no reason keyword (e.g. holiday names) are ignored
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**❌ Out today**")
+        if out or unnamed:
+            for _f, full, role in ROSTER:
+                if full in out:
+                    st.write(f"**{full}** — {out[full]} ({role})")
+            for u in unnamed:
+                st.write(u)
+        else:
+            st.write("Everyone is in. 🎉")
+    with c2:
+        st.markdown("**✅ Here today**")
+        here = [full for _f, full, _r in ROSTER if full not in out]
+        st.write(", ".join(here) if here else "—")
 
-    st.markdown("### ❌ Out today")
-    if out or unnamed:
-        for first, full, role in ROSTER:
-            if full in out:
-                st.write(f"**{full}** — {out[full]} ({role})")
-        for u in unnamed:
-            st.write(u)
-    else:
-        st.write("Everyone is in. 🎉")
-
-    st.markdown("### ✅ Here today")
-    here = [full for _f, full, _r in ROSTER if full not in out]
-    st.write(", ".join(here) if here else "—")
-
+# ---- month grid ----
 st.markdown("---")
-st.markdown("### This week")
-monday = today - timedelta(days=today.weekday())
-for i in range(6):  # Mon-Sat
-    d = monday + timedelta(days=i)
-    if d > today + timedelta(days=6):
-        break
-    try:
-        cr = closed_reason(d)
-        notes = [] if cr else notes_for(d)
-    except Exception:
-        cr, notes = None, []
-    label = d.strftime("%a %m/%d")
-    if cr:
-        st.write(f"**{label}** — closed ({cr})")
-    elif notes:
-        st.write(f"**{label}** — " + "; ".join(notes))
-    else:
-        st.write(f"**{label}** — —")
+n1, n2, n3 = st.columns([1, 4, 1])
+with n1:
+    if st.button("◀ Prev", disabled=(cur_idx + st.session_state.moff) <= 0):
+        st.session_state.moff -= 1
+        st.rerun()
+with n2:
+    st.markdown(f"<h3 style='text-align:center;margin:0'>{sel}</h3>",
+                unsafe_allow_html=True)
+with n3:
+    if st.button("Next ▶",
+                 disabled=(cur_idx + st.session_state.moff) >= len(MONTHS) - 1):
+        st.session_state.moff += 1
+        st.rerun()
+
+st.markdown(render_month(year, mon, weeks, closed, today),
+            unsafe_allow_html=True)
+st.caption("Notes are written in the Attendance Calendar sheet — "
+           "this page is read-only.")
