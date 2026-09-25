@@ -13,6 +13,7 @@ This app is READ ONLY - all editing stays in the Google Sheet. Note format
 the app parses (written in the cells under the day number in the month tab):
     "Danny Called out"  -> out, reason "Called out"
     "PTO - Matt"        -> out, reason "PTO"
+    "Angel Off"         -> out, reason "Day off" (regular scheduled day off)
 """
 
 from datetime import date
@@ -71,6 +72,8 @@ REASONS = [
     ("bereavement", "Bereavement"),
     ("funeral", "Bereavement"),
     ("jury duty", "Jury duty"),
+    ("day off", "Day off"),
+    ("off", "Day off"),
 ]
 
 
@@ -154,7 +157,7 @@ def parse_note(note):
 def note_class(note):
     """CSS class for a calendar cell note."""
     _name, reason = parse_note(note)
-    if reason in ("PTO", "Vacation"):
+    if reason in ("PTO", "Vacation", "Day off"):
         return "pto"
     if reason in ("Called out", "Sick"):
         return "out"
